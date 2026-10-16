@@ -822,7 +822,7 @@ pub(crate) mod linux {
         written
     }
 
-    /// Refreshes existing launcher-owned entries when its AppImage runtime changes.
+    /// Adds the configured AppImage runtime to unchanged launcher-generated entries.
     pub fn refresh_menu_entries(manifest: &crate::manifest::Manifest) {
         if process::in_sandbox() {
             return;
@@ -845,15 +845,35 @@ pub(crate) mod linux {
             return;
         }
         let Ok(old) = std::fs::read_to_string(&desktop) else { return };
-        if !crate::desktop_entry::is_ours(&old) || !crate::desktop_entry::runs_appimage(&old, appimage) {
+        let icon = icon_path(data, app).is_file();
+        let Some(text) = crate::desktop_entry::render(app, appimage, icon, Some(runner)) else { return };
+        if text == old {
             return;
         }
-        let Some(text) = crate::desktop_entry::render(app, appimage, icon_path(data, app).is_file(), Some(runner)) else {
+        // The marker and target alone do not mean the names, arguments, extensions or
+        // desktop actions are still ours to replace. Recognize only complete generated
+        // entries, allowing either icon state in case the icon was added or removed later.
+        let prefix = format!("Exec=env {}_NO_DESKTOP_INTEGRATION=1 ", app.id.to_ascii_uppercase());
+        let unchanged = [false, true].into_iter().any(|had_icon| {
+            let direct = crate::desktop_entry::render(app, appimage, had_icon, None);
+            if direct.as_deref() == Some(old.as_str()) {
+                return true;
+            }
+            // Earlier runtime-aware entries used this same helper without the AppRun
+            // opt-out or TryExec. A different helper could be a user's custom wrapper.
+            let Some(canonical) = crate::desktop_entry::render(app, appimage, had_icon, Some(runner)) else { return false };
+            let legacy = canonical
+                .replacen(&prefix, "Exec=", 1)
+                .lines()
+                .filter(|line| !line.starts_with("TryExec="))
+                .map(|line| format!("{line}\n"))
+                .collect::<String>();
+            old == canonical || old == legacy
+        });
+        if !unchanged {
             return;
-        };
-        if text != old
-            && let Err(e) = crate::paths::write_atomic(&desktop, text.as_bytes())
-        {
+        }
+        if let Err(e) = crate::paths::write_atomic(&desktop, text.as_bytes()) {
             log::warn!("{}: couldn't refresh the menu entry: {e}", app.name);
         }
     }
@@ -1645,6 +1665,131 @@ mod tests {
         linux::refresh_owned_menu_entry(&data, app, &image, Path::new("/different/runner"));
         assert!(desktop.is_symlink());
         assert_eq!(std::fs::read_to_string(&target).unwrap(), text);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_refresh_preserves_customized_entries() {
+        use std::os::unix::fs::MetadataExt;
+
+        let app = CraftApp::by_id("wordcraft").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("share");
+        let image = root.path().join("My Apps/100% wordcraft.AppImage");
+        let runner = root.path().join("My Runtime/appimage-run");
+        std::fs::create_dir_all(image.parent().unwrap()).unwrap();
+        std::fs::write(&image, b"").unwrap();
+        let desktop = data.join("applications/ai.storyteller.wordcraft.desktop");
+        std::fs::create_dir_all(desktop.parent().unwrap()).unwrap();
+        let direct = crate::desktop_entry::render(app, &image, false, None).unwrap();
+        let runtime = crate::desktop_entry::render(app, &image, false, Some(&runner)).unwrap();
+        for canonical in [&direct, &runtime] {
+            let exec = canonical.lines().find(|line| line.starts_with("Exec=")).unwrap();
+            let customizations = [
+                canonical.replace("Name=WordCraft\n", "Name=My Writer\n"),
+                canonical.replace(&format!("Comment={}\n", app.tagline), "Comment=My own description\n"),
+                canonical.replace(exec, &format!("{exec} --safe-mode")),
+                canonical.replace(exec, "Exec=/usr/local/bin/my-wrapper %F"),
+                canonical.replace(exec, "Exec=\"/my/custom wrapper\" %F"),
+                format!("{canonical}Exec=/another/program %F\n"),
+                canonical.replace("Terminal=false", "Terminal=true"),
+                format!("{canonical}TryExec=/my/wrapper\n"),
+                canonical.replace("[Desktop Entry]", "[Desktop Action Custom]"),
+                format!("{canonical}X-My-Setting=keep\n"),
+                format!("{canonical}Name[fr]=Mon traitement de texte\n"),
+                format!("{canonical}Actions=New;\n\n[Desktop Action New]\nName=New document\nExec=wordcraft --new\n"),
+                format!("# My desktop entry\n{canonical}"),
+                canonical.replace(crate::desktop_entry::MARKER, ""),
+            ];
+            for customized in customizations {
+                std::fs::write(&desktop, &customized).unwrap();
+                let inode = std::fs::metadata(&desktop).unwrap().ino();
+                linux::refresh_owned_menu_entry(&data, app, &image, &runner);
+                assert_eq!(std::fs::read_to_string(&desktop).unwrap(), customized);
+                assert_eq!(std::fs::metadata(&desktop).unwrap().ino(), inode, "preserved entries must not be rewritten");
+            }
+        }
+        let other_app = crate::desktop_entry::render(CraftApp::by_id("photocraft").unwrap(), &image, false, None).unwrap();
+        std::fs::write(&desktop, &other_app).unwrap();
+        linux::refresh_owned_menu_entry(&data, app, &image, &runner);
+        assert_eq!(std::fs::read_to_string(&desktop).unwrap(), other_app);
+        let custom_runner = crate::desktop_entry::render(app, &image, false, Some(Path::new("/my/wrapper"))).unwrap();
+        std::fs::write(&desktop, &custom_runner).unwrap();
+        linux::refresh_owned_menu_entry(&data, app, &image, &runner);
+        assert_eq!(std::fs::read_to_string(&desktop).unwrap(), custom_runner);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_refresh_migrates_only_known_legacy_entries() {
+        let app = CraftApp::by_id("wordcraft").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("share");
+        let image = root.path().join("My Apps/100% wordcraft.AppImage");
+        let runner = root.path().join("My Runtime/appimage-run");
+        std::fs::create_dir_all(image.parent().unwrap()).unwrap();
+        std::fs::write(&image, b"").unwrap();
+        let desktop = data.join("applications/ai.storyteller.wordcraft.desktop");
+        std::fs::create_dir_all(desktop.parent().unwrap()).unwrap();
+        let direct = crate::desktop_entry::render(app, &image, false, None).unwrap();
+        let image_exec = crate::desktop_entry::exec_quote(&image).unwrap();
+        let runner_exec = crate::desktop_entry::exec_quote(&runner).unwrap();
+        let legacy = direct.replace(&format!("Exec={image_exec}"), &format!("Exec={runner_exec} {image_exec}"));
+        let expected = crate::desktop_entry::render(app, &image, false, Some(&runner)).unwrap();
+        std::fs::write(&desktop, &legacy).unwrap();
+        linux::refresh_owned_menu_entry(&data, app, &image, &runner);
+        assert_eq!(std::fs::read_to_string(&desktop).unwrap(), expected);
+        // An icon added or removed since generation does not turn a canonical entry into
+        // a customization. Refresh the desktop entry without creating or replacing icons.
+        let icon = data.join("icons/hicolor/128x128/apps/ai.storyteller.wordcraft.png");
+        let with_icon = crate::desktop_entry::render(app, &image, true, None).unwrap();
+        std::fs::write(&desktop, &with_icon).unwrap();
+        linux::refresh_owned_menu_entry(&data, app, &image, &runner);
+        assert_eq!(std::fs::read_to_string(&desktop).unwrap(), expected);
+        assert!(!icon.exists());
+        std::fs::create_dir_all(icon.parent().unwrap()).unwrap();
+        std::fs::write(&icon, b"custom icon").unwrap();
+        std::fs::write(&desktop, &direct).unwrap();
+        linux::refresh_owned_menu_entry(&data, app, &image, &runner);
+        assert_eq!(std::fs::read_to_string(&desktop).unwrap(), crate::desktop_entry::render(app, &image, true, Some(&runner)).unwrap());
+        assert_eq!(std::fs::read(&icon).unwrap(), b"custom icon");
+        // A similarly shaped entry using a different helper has no recorded provenance.
+        let foreign = legacy.replace(&runner_exec, "\"/my/wrapper\"");
+        std::fs::write(&desktop, &foreign).unwrap();
+        linux::refresh_owned_menu_entry(&data, app, &image, &runner);
+        assert_eq!(std::fs::read_to_string(&desktop).unwrap(), foreign);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_refresh_keeps_filesystem_boundaries() {
+        let app = CraftApp::by_id("wordcraft").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("share");
+        let image = root.path().join("wordcraft.AppImage");
+        let runner = root.path().join("appimage-run");
+        let desktop = data.join("applications/ai.storyteller.wordcraft.desktop");
+        std::fs::create_dir_all(desktop.parent().unwrap()).unwrap();
+        std::fs::write(&image, b"").unwrap();
+        linux::refresh_owned_menu_entry(&data, app, &image, &runner);
+        assert!(!desktop.exists(), "refresh must not create missing entries");
+        let invalid = b"[Desktop Entry]\nName=\xff\n";
+        std::fs::write(&desktop, invalid).unwrap();
+        linux::refresh_owned_menu_entry(&data, app, &image, &runner);
+        assert_eq!(std::fs::read(&desktop).unwrap(), invalid);
+        std::fs::remove_file(&desktop).unwrap();
+        let canonical = crate::desktop_entry::render(app, &image, false, None).unwrap();
+        let target = root.path().join("custom.desktop");
+        std::fs::write(&target, &canonical).unwrap();
+        std::os::unix::fs::symlink(&target, &desktop).unwrap();
+        linux::refresh_owned_menu_entry(&data, app, &image, &runner);
+        assert!(desktop.is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), canonical);
+        std::fs::remove_file(&desktop).unwrap();
+        std::fs::remove_file(&image).unwrap();
+        std::fs::write(&desktop, &canonical).unwrap();
+        linux::refresh_owned_menu_entry(&data, app, &image, &runner);
+        assert_eq!(std::fs::read_to_string(&desktop).unwrap(), canonical, "a missing AppImage must not be reintegrated");
     }
 
     #[cfg(target_os = "linux")]
